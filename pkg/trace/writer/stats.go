@@ -6,6 +6,8 @@
 package writer
 
 import (
+	"compress/gzip"
+	"io"
 	"math"
 	"strings"
 	"sync/atomic"
@@ -16,8 +18,10 @@ import (
 	"github.com/DataDog/datadog-agent/pkg/trace/logutil"
 	"github.com/DataDog/datadog-agent/pkg/trace/metrics"
 	"github.com/DataDog/datadog-agent/pkg/trace/metrics/timing"
-	"github.com/DataDog/datadog-agent/pkg/trace/stats"
+	"github.com/DataDog/datadog-agent/pkg/trace/pb"
 	"github.com/DataDog/datadog-agent/pkg/util/log"
+
+	"github.com/tinylib/msgp/msgp"
 )
 
 // pathStats is the target host API path for delivering stats.
@@ -36,9 +40,10 @@ const (
 
 // StatsWriter ingests stats buckets and flushes them to the API.
 type StatsWriter struct {
-	in       <-chan []stats.Bucket
+	in       <-chan []pb.ClientStatsBucket
 	hostname string
 	env      string
+	version  string
 	senders  []*sender
 	stop     chan struct{}
 	stats    *info.StatsWriterInfo
@@ -47,11 +52,12 @@ type StatsWriter struct {
 }
 
 // NewStatsWriter returns a new StatsWriter. It must be started using Run.
-func NewStatsWriter(cfg *config.AgentConfig, in <-chan []stats.Bucket) *StatsWriter {
+func NewStatsWriter(cfg *config.AgentConfig, in <-chan []pb.ClientStatsBucket) *StatsWriter {
 	sw := &StatsWriter{
 		in:       in,
 		hostname: cfg.Hostname,
 		env:      cfg.DefaultEnv,
+		version:  "todo",
 		stats:    &info.StatsWriterInfo{},
 		stop:     make(chan struct{}),
 		easylog:  logutil.NewThrottled(5, 10*time.Second), // no more than 5 messages every 10 seconds
@@ -102,7 +108,7 @@ func (w *StatsWriter) Stop() {
 	stopSenders(w.senders)
 }
 
-func (w *StatsWriter) addStats(s []stats.Bucket) {
+func (w *StatsWriter) addStats(s []pb.ClientStatsBucket) {
 	defer timing.Since("datadog.trace_agent.stats_writer.encode_ms", time.Now())
 
 	payloads, bucketCount, entryCount := w.buildPayloads(s, maxEntriesPerPayload)
@@ -121,45 +127,52 @@ func (w *StatsWriter) addStats(s []stats.Bucket) {
 }
 
 // SendPayload sends a stats payload to the Datadog backend.
-func (w *StatsWriter) SendPayload(p *stats.Payload) {
+func (w *StatsWriter) SendPayload(p *pb.ClientStatsPayload) {
 	req := newPayload(map[string]string{
 		headerLanguages:    strings.Join(info.Languages(), "|"),
 		"Content-Type":     "application/json",
 		"Content-Encoding": "gzip",
 	})
-	if err := stats.EncodePayload(req.body, p); err != nil {
+	if err := encodePayload(req.body, p); err != nil {
 		log.Errorf("Stats encoding error: %v", err)
 		return
 	}
 	atomic.AddInt64(&w.stats.Bytes, int64(req.body.Len()))
-
 	sendPayloads(w.senders, req)
+}
+
+// encodePayload encodes the payload as Gzipped msgPack into w.
+func encodePayload(w io.Writer, payload *pb.ClientStatsPayload) error {
+	gz, err := gzip.NewWriterLevel(w, gzip.BestSpeed)
+	if err != nil {
+		return err
+	}
+	defer func() {
+		if err := gz.Close(); err != nil {
+			log.Errorf("Error closing gzip stream when writing stats payload: %v", err)
+		}
+	}()
+	return msgp.Encode(gz, payload)
 }
 
 // buildPayloads returns a set of payload to send out, each paylods guaranteed
 // to have the number of stats buckets under the given maximum.
-func (w *StatsWriter) buildPayloads(s []stats.Bucket, maxEntriesPerPayloads int) ([]*stats.Payload, int, int) {
+func (w *StatsWriter) buildPayloads(s []pb.ClientStatsBucket, maxEntriesPerPayloads int) ([]*pb.ClientStatsPayload, int, int) {
 	if len(s) == 0 {
-		return []*stats.Payload{}, 0, 0
+		return nil, 0, 0
 	}
-	// 1. Get an estimate of how many payloads we need, based on the total
-	//    number of map entries (i.e.: sum of number of items in the stats
-	//    bucket's count map).
-	//    NOTE: we use the number of items in the count map as the
-	//    reference, but in reality, what take place are the
-	//    distributions. We are guaranteed the number of entries in the
-	//    count map is > than the number of entries in the distributions
-	//    maps, so the algorithm is correct, but indeed this means we could
-	//    do better.
+	// 1. Get how many payloads we need, based on the total number of entries.
 	nbEntries := 0
-	for _, s := range s {
-		nbEntries += len(s.Counts)
+	for _, b := range s {
+		nbEntries += len(b.Stats)
 	}
+	// todo[piochelepiotr] we should change max since 1 Stats is equivalent to 3 counts.
 	if maxEntriesPerPayloads <= 0 || nbEntries < maxEntriesPerPayloads {
 		// nothing to do, break early
-		return []*stats.Payload{{
-			HostName: w.hostname,
+		return []*pb.ClientStatsPayload{{
+			Hostname: w.hostname,
 			Env:      w.env,
+			Version:  w.version,
 			Stats:    s,
 		}}, len(s), nbEntries
 	}
@@ -168,71 +181,41 @@ func (w *StatsWriter) buildPayloads(s []stats.Bucket, maxEntriesPerPayloads int)
 		nbPayloads++
 	}
 
-	type timeWindow struct{ start, duration int64 }
-	// 2. Create a slice of nbPayloads maps, mapping a time window (stat +
-	//    duration) to a stat bucket. We will build the payloads from these
-	//    maps. This allows is to have one stat bucket per time window.
-	pMaps := make([]map[timeWindow]stats.Bucket, nbPayloads)
+	// 2. Initialize a slice of nbPayloads indexes maps, mapping a time window (stat +
+	//    duration) to a stats payload.
+	type timeWindow struct{ start, duration uint64 }
+	indexes := make([]map[timeWindow]int, nbPayloads)
+	payloads := make([]*pb.ClientStatsPayload, nbPayloads)
 	for i := 0; i < nbPayloads; i++ {
-		pMaps[i] = make(map[timeWindow]stats.Bucket, nbPayloads)
+		indexes[i] = make(map[timeWindow]int, nbPayloads)
+		payloads[i] = &pb.ClientStatsPayload{
+			Hostname: w.hostname,
+			Env:      w.env,
+			Version:  w.version,
+			Stats:    make([]pb.ClientStatsBucket, 0, maxEntriesPerPayload),
+		}
 	}
 	// 3. Iterate over all entries of each stats. Add the entry to one of
-	//    the payload container mappings, in a round robin fashion. In some
-	//    edge cases, we can end up having the same entry in several
-	//    inputted stat buckets. We must check that we never overwrite an
-	//    entry in the new stats buckets but cleanly merge instead.
+	//    the payloads, in a round robin fashion. Use the indexes maps to
+	//    ensure that we have one ClientStatsBucket per timeWindow for each ClientStatsPayoad.
 	i := 0
+	nbStats := 0
 	for _, b := range s {
 		tw := timeWindow{b.Start, b.Duration}
-
-		for ekey, e := range b.Counts {
-			pm := pMaps[i%nbPayloads]
-			newsb, ok := pm[tw]
+		for _, g := range b.Stats {
+			j := i % nbPayloads
+			indexMap := indexes[j]
+			bi, ok := indexMap[tw]
 			if !ok {
-				newsb = stats.NewBucket(tw.start, tw.duration)
+				nbStats++
+				bi = len(payloads[j].Stats)
+				indexMap[tw] = bi
+				payloads[j].Stats = append(payloads[j].Stats, pb.ClientStatsBucket{Start: tw.start, Duration: tw.duration})
 			}
-			pm[tw] = newsb
-
-			if _, ok := newsb.Counts[ekey]; ok {
-				newsb.Counts[ekey].Merge(e)
-			} else {
-				newsb.Counts[ekey] = e
-			}
-
-			if _, ok := b.Distributions[ekey]; ok {
-				if _, ok := newsb.Distributions[ekey]; ok {
-					newsb.Distributions[ekey].Merge(b.Distributions[ekey])
-				} else {
-					newsb.Distributions[ekey] = b.Distributions[ekey]
-				}
-			}
-			if _, ok := b.ErrDistributions[ekey]; ok {
-				if _, ok := newsb.ErrDistributions[ekey]; ok {
-					newsb.ErrDistributions[ekey].Merge(b.ErrDistributions[ekey])
-				} else {
-					newsb.ErrDistributions[ekey] = b.ErrDistributions[ekey]
-				}
-			}
+			// here, we can just append the group, because there is no duplicate groups in the original stats payloads sent to the writer.
+			payloads[j].Stats[bi].Stats = append(payloads[j].Stats[bi].Stats, g)
 			i++
 		}
-	}
-	// 4. Create the nbPayloads payloads from the maps.
-	nbStats := 0
-	nbEntries = 0
-	payloads := make([]*stats.Payload, 0, nbPayloads)
-	for _, pm := range pMaps {
-		pstats := make([]stats.Bucket, 0, len(pm))
-		for _, sb := range pm {
-			pstats = append(pstats, sb)
-			nbEntries += len(sb.Counts)
-		}
-		payloads = append(payloads, &stats.Payload{
-			HostName: w.hostname,
-			Env:      w.env,
-			Stats:    pstats,
-		})
-
-		nbStats += len(pstats)
 	}
 	return payloads, nbStats, nbEntries
 }
